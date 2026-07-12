@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Brain runtime data (not committed - regenerates from WAL)
+data/brain.db
+data/brain.db-wal
+data/brain.db-shm
+data/wal/*.wal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+
+# Claude Code
+.claude/
