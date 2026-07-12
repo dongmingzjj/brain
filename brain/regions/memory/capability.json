@@ -1,0 +1,39 @@
+{
+  "region": "memory",
+  "version": "0.1.0",
+  "description": "存储、检索和管理长期记忆",
+  "capabilities": ["store", "retrieve", "forget", "decay", "boost"],
+  "subscriptions": [
+    {
+      "signal_type": "recall_request",
+      "priority": "high",
+      "auto_activate": true
+    },
+    {
+      "signal_type": "store_request",
+      "priority": "high",
+      "auto_activate": true
+    },
+    {
+      "signal_type": "perception_result",
+      "priority": "medium",
+      "auto_activate": true,
+      "condition": "confidence > 0.5"
+    }
+  ],
+  "outputs": [
+    "recall_result",
+    "store_confirmation",
+    "memory_stats"
+  ],
+  "local_improver": {
+    "algorithm": "threshold_adaptation + importance_decay + popularity_boost",
+    "llm_free": true,
+    "cycle_interval_seconds": 3600
+  },
+  "executor": {
+    "backend": "sqlite",
+    "retrieval": "keyword_matching",
+    "upgrade_path": ["bm25", "vector_similarity"]
+  }
+}
