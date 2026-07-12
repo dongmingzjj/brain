@@ -12,6 +12,7 @@ Brain Phase 0 主入口
 """
 
 import sys
+import os
 import json
 from brain.config import BrainConfig
 from brain.wal import WALWriter
@@ -22,6 +23,9 @@ from brain.verifier import Verifier
 
 
 from brain.hermes_db import HermesSessionReader
+from brain.regions.memory.executor import MemoryExecutor
+from brain.regions.memory.local_improver import LocalImprover
+from brain.regions.memory.metrics import MemoryMetrics
 
 
 def get_components():
@@ -29,14 +33,19 @@ def get_components():
     cfg.ensure_dirs()
     wal = WALWriter(cfg.wal_dir, cfg.max_entries_per_shard)
     db = BrainDB(cfg.db_path)
-    return cfg, wal, db
+    # Memory Region
+    memory_db = os.path.join(cfg.brain_dir, "data", "memory.db")
+    mem_executor = MemoryExecutor(memory_db)
+    mem_improver = LocalImprover(mem_executor)
+    mem_metrics = MemoryMetrics(mem_executor)
+    return cfg, wal, db, mem_executor, mem_improver, mem_metrics
 
 
 # ─── seed ──────────────────────────────────────────────────
 
 def seed():
     """导入种子校准失败数据（从 Hermes 历史对话中手工挑选的案例）"""
-    cfg, wal, db = get_components()
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
 
     seed_failures = [
         # ─── 训练集（8 条，Arbitrator 可见）───
@@ -172,8 +181,8 @@ def seed():
 
 def scan():
     """扫描 Hermes 真实对话历史，捕获校准失败"""
-    cfg, wal, db = get_components()
-    capture = CalibrationCapture(wal, db)
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
+    capture = CalibrationCapture(wal, db, mem_executor=mem_executor)
     reader = HermesSessionReader()
 
     # 预估轮次数量
@@ -224,8 +233,8 @@ def scan():
 
 def arbitrate():
     """生成新校准建议"""
-    cfg, wal, db = get_components()
-    arb = Arbitrator(wal, db)
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
+    arb = Arbitrator(wal, db, mem_executor=mem_executor)
 
     print("Arbitrator 生成校准建议...")
     result = arb.propose_advisory()
@@ -244,7 +253,7 @@ def arbitrate():
 
 def verify():
     """验证最新建议"""
-    cfg, wal, db = get_components()
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
     ver = Verifier(wal, db)
 
     print("Verifier 验证最新建议...")
@@ -266,13 +275,16 @@ def verify():
 
 def report():
     """输出校准报告"""
-    cfg, wal, db = get_components()
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
 
     total = db.get_total_failures()
     stats = db.get_failure_stats()
     current = db.get_current_advisory()
     adv_stats = db.get_advisory_count()
     wal_check = wal.rebuild_check()
+
+    # Memory Region 指标
+    mem_stats = mem_metrics.compute_all()
 
     print(f"\n{'='*60}")
     print(f"  Brain 校准报告")
@@ -281,6 +293,13 @@ def report():
     print(f"\n📊 存储状态")
     print(f"   WAL: {wal_check['total_entries']} 条事件, {wal_check['shards']} 个分片, 完整性: {wal_check['integrity']}")
     print(f"   SQLite: {db_path_short(cfg.db_path)}")
+
+    print(f"\n🧠 Memory Region")
+    print(f"   记忆数: {mem_stats['total_memories']}")
+    print(f"   平均重要性: {mem_stats['avg_importance']:.3f}")
+    print(f"   总访问: {mem_stats['total_accesses']}")
+    print(f"   高重要性占比: {mem_stats['high_importance_ratio']:.0%}")
+    print(f"   7天未访问占比: {mem_stats['stale_memory_ratio']:.0%}")
 
     print(f"\n📈 校准失败统计")
     print(f"   总失败记录: {total}")
@@ -314,7 +333,7 @@ def db_path_short(path):
 
 def rebuild():
     """从 WAL 重建 SQLite（崩溃恢复）"""
-    cfg, wal, db = get_components()
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
 
     print("从 WAL 重建 SQLite...")
     entries = wal.read_all()
@@ -329,21 +348,64 @@ def rebuild():
     print(f"  WAL 完整性: {check['integrity']}")
 
 
+# ─── improve ───────────────────────────────────────────────
+
+def improve():
+    """运行 Memory Region Local Improver 循环"""
+    cfg, wal, db, mem_executor, mem_improver, mem_metrics = get_components()
+
+    print("Memory Region Local Improver 循环...")
+    print()
+
+    # 运行前指标
+    before = mem_metrics.compute_all()
+    print(f"  运行前: {before['total_memories']} 条记忆, "
+          f"平均重要性 {before['avg_importance']:.3f}, "
+          f"总访问 {before['total_accesses']}")
+
+    # 执行改进循环
+    result = mem_improver.run_cycle()
+
+    # 运行后指标
+    after = mem_metrics.compute_all()
+    print(f"  运行后: {after['total_memories']} 条记忆, "
+          f"平均重要性 {after['avg_importance']:.3f}, "
+          f"总访问 {after['total_accesses']}")
+
+    # 执行的动作
+    if result["actions_taken"]:
+        print(f"\n  执行动作:")
+        for action in result["actions_taken"]:
+            print(f"    {action['action']}: {action.get('count', action.get('new_threshold', ''))}")
+    else:
+        print(f"\n  无动作执行")
+
+    improvement = result["improvement"]
+    emoji = "📈" if improvement > 0 else "📉" if improvement < 0 else "➖"
+    print(f"\n  {emoji} 改善度: {improvement:+.3f}")
+
+
 # ─── run (一键跑完) ────────────────────────────────────────
 
 def run():
-    """一键跑完: arbitrate → verify → report"""
+    """一键跑完: scan → arbitrate → verify → improve → report"""
     print("=" * 60)
-    print("  Brain Phase 0 — 第一轮完整运行")
+    print("  Brain 完整循环")
     print("=" * 60)
 
-    print("\n[1/3] Arbitrator 生成校准建议...")
+    print("\n[1/5] 扫描对话...")
+    scan()
+
+    print("\n[2/5] 生成校准建议...")
     arbitrate()
 
-    print("\n[2/3] Verifier 验证建议...")
+    print("\n[3/5] 验证建议...")
     verify()
 
-    print("\n[3/3] 校准报告...")
+    print("\n[4/5] Memory Region 改进循环...")
+    improve()
+
+    print("\n[5/5] 校准报告...")
     report()
 
 
@@ -355,6 +417,7 @@ if __name__ == "__main__":
         "scan": scan,
         "arbitrate": arbitrate,
         "verify": verify,
+        "improve": improve,
         "report": report,
         "rebuild": rebuild,
         "run": run,

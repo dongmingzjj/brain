@@ -48,9 +48,13 @@ AI助手: {assistant_msg}
 class CalibrationCapture:
     """分析对话历史，捕获校准失败"""
 
-    def __init__(self, wal: WALWriter, db: BrainDB):
+    def __init__(self, wal: WALWriter, db: BrainDB, mem_executor=None):
+        """
+        mem_executor: Memory Region 执行器（可选，用于存储到 Memory Region）
+        """
         self.wal = wal
         self.db = db
+        self.mem_executor = mem_executor
 
     def analyze_turn(self, user_msg: str, assistant_msg: str,
                      session_id: str = "") -> dict | None:
@@ -115,5 +119,22 @@ class CalibrationCapture:
         self.db.add_calibration_failure(
             seq=seq, created_at=ts, **failure_data
         )
+
+        # 同步 Memory Region（如果可用）
+        if self.mem_executor:
+            self.mem_executor.store(
+                key=f"failure:{error_type}:{failure_data.get('question_summary', '')[:30]}",
+                value=json.dumps({
+                    "error_type": error_type,
+                    "question_summary": failure_data.get("question_summary", ""),
+                    "wrong_answer_summary": failure_data.get("wrong_answer_summary", ""),
+                    "correction_summary": failure_data.get("correction_summary", ""),
+                    "question_type": failure_data.get("question_type", ""),
+                }, ensure_ascii=False),
+                mem_type="calibration_failure",
+                importance=0.7,
+                tags=[error_type, failure_data.get("question_type", "")],
+                source="capture",
+            )
 
         return {"seq": seq, **failure_data}
