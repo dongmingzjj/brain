@@ -17,7 +17,7 @@ class BrainConfig:
     max_entries_per_shard: int = 10000
 
     # 校准参数
-    capture_batch_size: int = 50        # 每次分析多少轮对话
+    capture_batch_size: int = 20        # 每次分析多少轮对话
     advisory_review_interval: int = 20  # 每积累多少条新失败重新生成建议
     test_set_size: int = 10             # 留出集大小
 

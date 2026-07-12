@@ -21,6 +21,9 @@ from brain.arbitrator import Arbitrator
 from brain.verifier import Verifier
 
 
+from brain.hermes_db import HermesSessionReader
+
+
 def get_components():
     cfg = BrainConfig()
     cfg.ensure_dirs()
@@ -168,9 +171,53 @@ def seed():
 # ─── scan ──────────────────────────────────────────────────
 
 def scan():
-    """扫描对话历史（TODO: 接入 Hermes session DB）"""
-    print("TODO: Phase 0 Step 3 — 接入 Hermes session DB 自动扫描")
-    print("当前请使用 'seed' 命令导入手工标注的失败案例")
+    """扫描 Hermes 真实对话历史，捕获校准失败"""
+    cfg, wal, db = get_components()
+    capture = CalibrationCapture(wal, db)
+    reader = HermesSessionReader()
+
+    # 预估轮次数量
+    sessions = reader.get_sessions_summary()
+    total_sessions = len(sessions)
+    print(f"Hermes session DB: {total_sessions} 个用户会话")
+
+    # 提取对话轮次
+    print("提取对话轮次...")
+    turns = reader.get_turns(min_assistant_len=80, exclude_subagent=True)
+    print(f"找到 {len(turns)} 个有效对话轮次\n")
+
+    # 限制批次大小（避免 API 成本爆炸）
+    batch_size = cfg.capture_batch_size
+    if len(turns) > batch_size:
+        print(f"只分析最近 {batch_size} 轮（超出部分跳过）")
+        turns = turns[-batch_size:]
+
+    # 逐轮分析
+    failures_found = 0
+    errors_skipped = 0
+
+    for i, turn in enumerate(turns):
+        print(f"[{i+1}/{len(turns)}] session={turn.session_title[:25]}...")
+        print(f"  Q: {turn.user_msg[:60]}...")
+
+        result = capture.analyze_turn(
+            user_msg=turn.user_msg,
+            assistant_msg=turn.assistant_msg,
+            session_id=turn.session_id,
+        )
+
+        if result:
+            failures_found += 1
+            print(f"  ⚠️  [{result['error_type']}] {result['correction_summary'][:60]}...")
+        else:
+            print(f"  ✓  无校准失败")
+
+    reader.close()
+
+    print(f"\n扫描完成:")
+    print(f"  分析轮次: {len(turns)}")
+    print(f"  发现失败: {failures_found}")
+    print(f"  总失败记录: {db.get_total_failures()}")
 
 
 # ─── arbitrate ─────────────────────────────────────────────

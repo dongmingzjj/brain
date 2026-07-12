@@ -100,7 +100,18 @@ class CalibrationCapture:
             timestamp=ts,
         )
 
-        # 同步 SQLite
+        # 先同步 events 表（满足外键约束）
+        self.db.index_event({
+            "seq": seq,
+            "timestamp": ts,
+            "actor": "capture",
+            "event_type": "failure_recorded",
+            "data": failure_data,
+            "evidence": {"confidence": result.get("confidence", 0)},
+            "verified": False,
+        })
+
+        # 同步 calibration_failures 表
         self.db.add_calibration_failure(
             seq=seq, created_at=ts, **failure_data
         )
