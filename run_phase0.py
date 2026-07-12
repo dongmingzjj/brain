@@ -258,8 +258,8 @@ def verify():
     print(f"\n{verdict_emoji} 裁决: {result['verdict'].upper()}")
     print(f"   建议版本: v{result['version']}")
     print(f"   B 更好率: {result['improvement_rate']:.0%} ({result['b_better_count']}/{result['case_count']})")
-    print(f"   防住错误: {result['prevention_rate']:.0%} ({result['b_avoided_count']}/{result['case_count']})")
-    print(f"   验证方法: A/B 行为测试（留出集 {result['case_count']} 条）")
+    print(f"   平均分差: {result.get('avg_score_diff', 0):+.2f}")
+    print(f"   验证方法: 确定性 A/B（模式匹配打分，不使用 LLM 判断）")
 
 
 # ─── report ────────────────────────────────────────────────
