@@ -1,21 +1,19 @@
 """
-Memory Region Executor — SQLite 存储 + 关键词检索。
+Memory Region Executor — SQLite 存储 + FTS5 BM25 检索。
 
-Phase 1 最简实现：
-  - SQLite 存储（内存条目 + 元数据）
-  - 关键词匹配检索（LIKE 查询，后续升级 BM25）
-  - 访问追踪（供 Local Improver 使用）
+检索引擎：
+  Phase 1.0: LIKE 关键词匹配（已废弃）
+  Phase 1.1: FTS5 trigram 分词 + BM25 排序（当前）
+  Phase 1.2: 向量相似度（未来，Qdrant/embedding）
 
-后续升级路径：
-  - SQLite → Qdrant（向量检索）
-  - LIKE → BM25 → 向量相似度
-  - 单机 → 分布式
+trigram 分词器对中英文混合内容都有很好的支持。
 """
 
 from __future__ import annotations
 import sqlite3
 import json
 import re
+import math
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -65,6 +63,43 @@ class MemoryExecutor:
                 FOREIGN KEY (memory_id) REFERENCES memories(id)
             );
         """)
+
+        # FTS5 虚拟表（trigram 分词，支持中文）
+        try:
+            self.conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(key, value, content='memories',
+                           tokenize='trigram')
+            """)
+        except Exception:
+            # 如果 trigram 不支持，退回 unicode61
+            self.conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(key, value, content='memories',
+                           tokenize='unicode61')
+            """)
+
+        # 创建 FTS5 触发器（自动同步）
+        self.conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories
+            BEGIN
+                INSERT INTO memories_fts(rowid, key, value)
+                VALUES (new.id, new.key, new.value);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories
+            BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, key, value)
+                VALUES ('delete', old.id, old.key, old.value);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
+            BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, key, value)
+                VALUES ('delete', old.id, old.key, old.value);
+                INSERT INTO memories_fts(rowid, key, value)
+                VALUES (new.id, new.key, new.value);
+            END;
+        """)
+
         self.conn.commit()
 
     # ─── 存储 ──────────────────────────────────────────────
@@ -92,20 +127,125 @@ class MemoryExecutor:
                  mem_type: str = None,
                  min_importance: float = 0.0) -> list[dict]:
         """
-        关键词检索记忆。
+        FTS5 BM25 检索记忆。
 
-        Phase 1: 简单 LIKE 匹配（按关键词拆分查询）
-        后续: BM25 / 向量相似度
+        引擎: FTS5 trigram 分词 + BM25 排序
+        比 LIKE 查询更准确：BM25 考虑词频、文档长度、逆文档频率。
+        trigram 分词器对中英文混合内容都有支持。
 
         返回:
             [{id, key, value, mem_type, importance, score, access_count}, ...]
         """
-        # 提取查询关键词
+        if not query or not query.strip():
+            return []
+
+        # 构建 FTS5 MATCH 查询
+        # 用 OR 连接多个词，支持部分匹配
+        fts_query = self._build_fts_query(query)
+        if not fts_query:
+            return []
+
+        # 执行 FTS5 查询 + BM25 排序
+        sql = """
+            SELECT m.id, m.key, m.value, m.mem_type, m.importance,
+                   m.access_count, m.tags,
+                   rank AS bm25_rank
+            FROM memories_fts f
+            JOIN memories m ON m.id = f.rowid
+            WHERE memories_fts MATCH ?
+        """
+        params = [fts_query]
+
+        if mem_type:
+            sql += " AND m.mem_type = ?"
+            params.append(mem_type)
+
+        if min_importance > 0:
+            sql += " AND m.importance >= ?"
+            params.append(min_importance)
+
+        # FTS5 rank 是负数（越小越相关），取多取一些然后用重要性加权重排
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(top_k * 3)  # 多取 3 倍候选，后面用重要性加权重排
+
+        try:
+            rows = self.conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            # FTS5 查询语法错误，退回 LIKE 查询
+            return self._retrieve_like(query, top_k, mem_type, min_importance)
+
+        if not rows:
+            # FTS5 没匹配到，退回 LIKE 查询
+            return self._retrieve_like(query, top_k, mem_type, min_importance)
+
+        results = []
+        for row in rows:
+            # BM25 分数转换：FTS5 rank 是负数，转为正数（越小越相关 → 越大越好）
+            bm25_score = -row["bm25_rank"] if row["bm25_rank"] else 0
+
+            # 混合分数：BM25 相关性 + 重要性 + 访问频率
+            importance = row["importance"] or 0.5
+            access_bonus = min(row["access_count"] or 0, 10) / 100
+
+            # 归一化 BM25（粗略：除以 10 把分数压到 0-1 区间附近）
+            bm25_normalized = min(bm25_score / 10, 1.0)
+
+            score = bm25_normalized * 0.6 + importance * 0.3 + access_bonus * 0.1
+
+            # 记录访问
+            self._log_access(row["id"], query, score)
+
+            results.append({
+                "id": row["id"],
+                "key": row["key"],
+                "value": row["value"],
+                "mem_type": row["mem_type"],
+                "importance": importance,
+                "access_count": row["access_count"] + 1,
+                "tags": json.loads(row["tags"] or "[]"),
+                "score": round(score, 4),
+                "bm25_rank": round(bm25_score, 4),
+            })
+
+        # 按混合分数重排
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results[:top_k]
+
+    def _build_fts_query(self, query: str) -> str:
+        """
+        将用户查询转换为 FTS5 MATCH 表达式。
+
+        策略：
+        - 中文 2-4 字词：用引号包起来做精确 trigram 匹配
+        - 英文 3+ 字母词：用引号 + * 做前缀匹配
+        - 用 OR 连接
+        """
+        keywords = self._extract_keywords(query)
+        if not keywords:
+            # 如果关键词提取失败，直接用原始查询做 trigram 搜索
+            stripped = query.strip()
+            if len(stripped) >= 3:
+                return f'"{stripped}"'
+            return ""
+
+        terms = []
+        for kw in keywords[:10]:
+            if len(kw) >= 2:
+                terms.append(f'"{kw}"')
+
+        if not terms:
+            return ""
+
+        return " OR ".join(terms)
+
+    def _retrieve_like(self, query: str, top_k: int = 5,
+                       mem_type: str = None,
+                       min_importance: float = 0.0) -> list[dict]:
+        """LIKE 退回检索（FTS5 不可用时使用）"""
         keywords = self._extract_keywords(query)
         if not keywords:
             return []
 
-        # 构建 LIKE 查询（任一关键词匹配即返回）
         conditions = []
         params = []
         for kw in keywords:
@@ -133,10 +273,7 @@ class MemoryExecutor:
 
         results = []
         for row in rows:
-            # 计算简单相关性分数
             score = self._compute_score(row, keywords)
-
-            # 记录访问
             self._log_access(row["id"], query, score)
 
             results.append({
@@ -150,7 +287,6 @@ class MemoryExecutor:
                 "score": score,
             })
 
-        # 按分数排序
         results.sort(key=lambda r: r["score"], reverse=True)
         return results
 
