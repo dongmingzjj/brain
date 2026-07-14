@@ -1,0 +1,32 @@
+{
+  "region": "perception",
+  "version": "0.1.0",
+  "description": "输入理解、意图分类、实体提取",
+  "capabilities": ["classify_intent", "extract_entities", "estimate_complexity", "analyze_sentiment"],
+  "subscriptions": [
+    {
+      "signal_type": "user_input",
+      "priority": "high",
+      "auto_activate": true
+    },
+    {
+      "signal_type": "raw_input",
+      "priority": "high",
+      "auto_activate": true
+    }
+  ],
+  "outputs": [
+    "perception_result",
+    "intent_classified",
+    "entities_extracted"
+  ],
+  "local_improver": {
+    "algorithm": "keyword_coverage_adaptation + confidence_monitoring",
+    "llm_free": true,
+    "cycle_interval_seconds": 3600
+  },
+  "executor": {
+    "backend": "keyword_matching + regex_entities",
+    "upgrade_path": ["ollama_embedding", "llm_intent_analysis"]
+  }
+}
