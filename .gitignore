@@ -21,6 +21,9 @@ data/brain.db
 data/brain.db-wal
 data/brain.db-shm
 data/wal/*.wal
+data/memory.db
+data/perception.db
+data/action_history.db
 
 # OS
 .DS_Store
