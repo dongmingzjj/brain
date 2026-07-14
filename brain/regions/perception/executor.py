@@ -56,6 +56,7 @@ INTENT_RULES = {
     "correction": {
         "keywords": ["不对", "错了", "不是", "重新", "修改", "wrong", "no", "not"],
         "weight": 0.7,
+        "word_boundary": True,  # 英文词需要词边界匹配
     },
 }
 
@@ -190,11 +191,17 @@ class PerceptionExecutor:
 
         for intent, rule in INTENT_RULES.items():
             score = 0
+            word_boundary = rule.get("word_boundary", False)
             for kw in rule["keywords"]:
-                if kw.lower() in text_lower:
-                    score += rule["weight"]
+                kw_lower = kw.lower()
+                if word_boundary and re.match(r'^[a-z]', kw_lower):
+                    # 英文词用词边界匹配
+                    if re.search(r'\b' + re.escape(kw_lower) + r'\b', text_lower):
+                        score += rule["weight"]
+                else:
+                    if kw_lower in text_lower:
+                        score += rule["weight"]
             if score > 0:
-                # 归一化：log(1 + score) 压缩范围
                 scores[intent] = round(score / (1 + score * 0.3), 3)
 
         return scores
