@@ -40,6 +40,7 @@ from brain.hermes_db import HermesSessionReader
 from brain.regions.memory.executor import MemoryExecutor
 from brain.regions.memory.local_improver import LocalImprover
 from brain.regions.memory.metrics import MemoryMetrics
+from brain.arbitrator_self_improve import ArbitratorSelfImprover
 
 
 # ─── SOUL.md 注入 ──────────────────────────────────────────
@@ -111,6 +112,14 @@ def run_cycle(batch_size: int = 20, skip_verify: bool = False):
     """
     运行完整校准循环。
 
+    流程：
+      1. scan:      扫描对话
+      2. arbitrate: 生成校准建议
+      3. verify:    A/B 行为测试
+      4. inject:    注入 SOUL.md
+      5. improve:   Memory Region 改进
+      6. self_improve: Arbitrator prompt 自改进
+
     返回:
         dict: 运行结果摘要
     """
@@ -121,6 +130,7 @@ def run_cycle(batch_size: int = 20, skip_verify: bool = False):
     memory_db = os.path.join(cfg.brain_dir, "data", "memory.db")
     mem_executor = MemoryExecutor(memory_db)
     mem_improver = LocalImprover(mem_executor)
+    self_improver = ArbitratorSelfImprover(wal, db)
 
     result = {
         "timestamp": utc_now(),
@@ -129,11 +139,12 @@ def run_cycle(batch_size: int = 20, skip_verify: bool = False):
         "advisory_generated": False,
         "verdict": None,
         "injected": False,
+        "self_improvement": None,
         "errors": [],
     }
 
     # ─── 1. SCAN ───────────────────────────────────────
-    print("[1/5] 扫描对话...")
+    print("[1/6] 扫描对话...")
     try:
         capture = CalibrationCapture(wal, db, mem_executor=mem_executor)
         reader = HermesSessionReader()
@@ -176,9 +187,11 @@ def run_cycle(batch_size: int = 20, skip_verify: bool = False):
         return result
 
     # ─── 2. ARBITRATE ─────────────────────────────────
-    print("\n[2/5] 生成校准建议...")
+    print("\n[2/6] 生成校准建议...")
     try:
-        arb = Arbitrator(wal, db, mem_executor=mem_executor)
+        # 使用自改进后的 prompt 模板（如有）
+        current_prompt = self_improver.get_current_prompt()
+        arb = Arbitrator(wal, db, mem_executor=mem_executor, prompt_template=current_prompt)
         adv_result = arb.propose_advisory()
 
         if adv_result.get("status") == "skipped":
@@ -199,7 +212,7 @@ def run_cycle(batch_size: int = 20, skip_verify: bool = False):
         return result
 
     # ─── 3. VERIFY ────────────────────────────────────
-    print("\n[3/5] A/B 行为测试...")
+    print("\n[3/6] A/B 行为测试...")
     try:
         ver = Verifier(wal, db)
         verify_result = ver.verify_latest()
@@ -218,22 +231,47 @@ def run_cycle(batch_size: int = 20, skip_verify: bool = False):
 
     # ─── 4. INJECT ────────────────────────────────────
     if result["verdict"] == "accepted":
-        print("\n[4/5] 注入 SOUL.md...")
+        print("\n[4/6] 注入 SOUL.md...")
         try:
             result["injected"] = inject_soul(result.get("advisory_content", ""))
         except Exception as e:
             result["errors"].append(f"inject: {e}")
             print(f"  [ERROR] inject: {e}")
     else:
-        print(f"\n[4/5] 建议未通过（{result.get('verdict', 'N/A')}），不注入")
+        print(f"\n[4/6] 建议未通过（{result.get('verdict', 'N/A')}），不注入")
 
     # ─── 5. IMPROVE ───────────────────────────────────
-    print("\n[5/5] Memory Region 改进循环...")
+    print("\n[5/6] Memory Region 改进循环...")
     try:
         imp = mem_improver.run_cycle()
         print(f"  改善度: {imp['improvement']:+.3f}")
     except Exception as e:
         result["errors"].append(f"improve: {e}")
+
+    # ─── 6. SELF-IMPROVE ─────────────────────────────
+    print("\n[6/6] Arbitrator 自改进分析...")
+    try:
+        self_imp = self_improver.analyze_and_improve()
+        result["self_improvement"] = {
+            "analysis": self_imp.get("analysis", ""),
+            "improvements": self_imp.get("improvements", []),
+            "prompt_changed": self_imp.get("prompt_changed", False),
+        }
+
+        if self_imp.get("prompt_changed") and self_imp.get("new_prompt"):
+            # 应用新 prompt
+            apply_result = self_improver.apply_improvement(self_imp["new_prompt"])
+            result["self_improvement"]["applied"] = True
+            result["self_improvement"]["new_version"] = apply_result["new_version"]
+            print(f"  Prompt 模板已更新 → v{apply_result['new_version']}")
+            print(f"  分析: {self_imp.get('analysis', '')[:80]}")
+        else:
+            print(f"  分析: {self_imp.get('analysis', '')[:80]}")
+            print(f"  无需更新 prompt 模板")
+
+    except Exception as e:
+        result["errors"].append(f"self_improve: {e}")
+        print(f"  [ERROR] self_improve: {e}")
 
     return result
 
@@ -277,6 +315,9 @@ if __name__ == "__main__":
         print(f"  建议生成: {'是' if result['advisory_generated'] else '否'}")
         print(f"  Verifier 裁决: {result.get('verdict', 'N/A')}")
         print(f"  注入 SOUL.md: {'是' if result['injected'] else '否'}")
+        if result.get("self_improvement"):
+            si = result["self_improvement"]
+            print(f"  Prompt 自改进: {'已更新 v' + str(si.get('new_version', '')) if si.get('applied') else '未更新'}")
         if result["errors"]:
             print(f"  错误: {len(result['errors'])} 个")
             for e in result["errors"]:
